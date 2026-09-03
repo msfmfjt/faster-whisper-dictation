@@ -1,11 +1,12 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "pywhispercpp",
+#     "openai-whisper",
 #     "sounddevice",
 #     "numpy",
 #     "pynput",
 #     "pyperclip",
+#     "torch",
 # ]
 # ///
 
@@ -13,18 +14,22 @@ import time
 import numpy as np
 import sounddevice as sd
 import pyperclip
+import torch
+import whisper
 from pynput import keyboard
-from pywhispercpp.model import Model
 
 # --- 設定 ---
-# whisper.cpp形式のモデルバイナリのパス
-MODEL_PATH = r"D:\offline_models\ggml-small.bin"
+# 手元にある .pt ファイルのパス
+MODEL_PATH = r"D:\offline_models\small.pt"
 SAMPLE_RATE = 16000
 TRIGGER_KEY = keyboard.Key.f8  # 録音トリガーキー
 
-print("whisper.cpp モデル読み込み中...")
-# n_threads でCPUのスレッド数（物理コア数推奨）を指定
-model = Model(MODEL_PATH, n_threads=4)
+# CPUでのスレッド競合を防ぎ、推論速度を最適化
+torch.set_num_threads(4)
+
+print("OpenAI Whisper モデル読み込み中...")
+# device="cpu" を指定して手元の .pt を直接ロード
+model = whisper.load_model(MODEL_PATH, device="cpu")
 print("準備完了！ [F8] キーを押しながら話してください。")
 
 # --- 録音バッファ管理 ---
@@ -57,23 +62,26 @@ def process_audio():
     # 録音データを結合して1次元のfloat32配列へ
     audio_data = np.concatenate(audio_buffer, axis=0).flatten().astype(np.float32)
     
-    # 0.3秒未満の入力はノイズとして除外
+    # 0.3秒未満の入力は破棄
     if len(audio_data) < SAMPLE_RATE * 0.3:
         return
 
-    # pywhispercpp による推論
-    # n_processors=1, language='ja' を指定
-    segments = model.transcribe(
+    # CPU推論向け高速化パラメータ
+    result = model.transcribe(
         audio_data,
         language="ja",
-        beam_size=1  # 速度優先のGreedy探索
+        fp16=False,                      # CPU実行時は必須（警告・エラー防止）
+        beam_size=1,                     # 探索幅を最小化（Greedy）
+        best_of=1,
+        temperature=0.0,
+        condition_on_previous_text=False # 前の文脈を引きずらず高速化
     )
     
-    result_text = "".join([s.text for s in segments]).strip()
+    result_text = result.get("text", "").strip()
     
     if result_text:
         print(f"認識結果: {result_text}")
-        # クリップボード経由で即時貼り付け
+        # クリップボード経由で自動貼り付け
         pyperclip.copy(result_text)
         ctrl = keyboard.Controller()
         with ctrl.pressed(keyboard.Key.ctrl):
