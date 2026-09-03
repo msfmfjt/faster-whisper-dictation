@@ -17,6 +17,18 @@ print(f"[1/3] ローカルの .pt ファイルを読み込み中...")
 model = whisper.load_model(PT_MODEL_PATH, device="cpu")
 model.eval()
 
+# Whisper 内で SDPA を直接呼ばせないようにモンキーパッチ
+import torch.nn.functional as F
+orig_sdpa = F.scaled_dot_product_attention
+
+def patched_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+    # is_causal がテンソルで渡ってきた場合は bool に強制キャスト、または attn_mask 側に統合
+    if not isinstance(is_causal, bool):
+        is_causal = False
+    return orig_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+
+F.scaled_dot_product_attention = patched_sdpa
+
 # --- 変換実行（SDPA を強制無効化するコンテキスト内で実行） ---
 with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
     
