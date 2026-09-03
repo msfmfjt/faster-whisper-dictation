@@ -1,49 +1,67 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "optimum-intel[openvino]",
+#     "openai-whisper",
+#     "openvino>=2024.0.0",
 #     "sounddevice",
 #     "numpy",
 #     "pynput",
 #     "pyperclip",
-#     "transformers",
+#     "torch",
 # ]
 # ///
 
+import os
 import time
 import numpy as np
 import sounddevice as sd
 import pyperclip
+import torch
+import whisper
+import openvino as ov
 from pynput import keyboard
-from optimum.intel.openvino import OVModelForSpeechSeq2Seq
-from transformers import AutoProcessor, pipeline
 
 # --- 設定 ---
-MODEL_PATH = r"./whisper-small-ov"  # ステップ1で生成したフォルダパス
+PT_MODEL_PATH = r"D:\offline_models\small.pt"               # トークナイザー・設定用の元モデル
+OV_ENCODER_PATH = r"./whisper-small-ov/whisper_encoder.xml" # 変換したエンコーダ
 SAMPLE_RATE = 16000
 TRIGGER_KEY = keyboard.Key.f8
 
-# "GPU" (内蔵 Arc GPU: 最速) または "NPU" (省電力・ファン静音)
+# "GPU" (内蔵 Arc GPU: 推奨・爆速) または "NPU"
 DEVICE = "GPU"
 
-print(f"OpenVINO モデルを {DEVICE} に展開中...")
-# 初回のみハードウェア向けコンパイルが走るため十数秒〜1分ほど要します
-model = OVModelForSpeechSeq2Seq.from_pretrained(
-    MODEL_PATH,
-    device=DEVICE,
-    ov_config={"PERFORMANCE_HINT": "LATENCY"}
-)
-processor = AutoProcessor.from_pretrained(MODEL_PATH)
+print("1. 元の Whisper 構造とトークナイザーを準備中...")
+model = whisper.load_model(PT_MODEL_PATH, device="cpu")
 
-pipe = pipeline(
-    "automatic-speech-recognition",
-    model=model,
-    tokenizer=processor.tokenizer,
-    feature_extractor=processor.feature_extractor,
-)
-print(f"準備完了！ [{DEVICE} 稼働] [F8] キーを押しながら話してください。")
+print(f"2. 変換した OpenVINO エンコーダを {DEVICE} にコンパイル中...")
+core = ov.Core()
+ov_model = core.read_model(OV_ENCODER_PATH)
+compiled_encoder = core.compile_model(ov_model, device_name=DEVICE)
+encoder_output_layer = compiled_encoder.output(0)
 
-# --- 録音バッファ管理 ---
+# --- 本家 Whisper の Encoder を OpenVINO 実装でハイジャック ---
+class OpenVINOEncoderWrapper(torch.nn.Module):
+    def __init__(self, compiled_model, original_encoder):
+        super().__init__()
+        self.compiled_model = compiled_model
+        self.conv1 = original_encoder.conv1  # 前処理層のプロパティを維持
+        
+    def forward(self, mel: torch.Tensor):
+        # mel: (batch, n_mels, 3000)
+        np_mel = mel.detach().cpu().numpy().astype(np.float32)
+        
+        # Core Ultra (Arc GPU / NPU) で実行
+        result = self.compiled_model([np_mel])[encoder_output_layer]
+        
+        # PyTorch テンソルに戻してデコーダへ渡す
+        return torch.from_numpy(result)
+
+# エンコーダを差し替え
+model.encoder = OpenVINOEncoderWrapper(compiled_encoder, model.encoder)
+
+print(f"\n準備完了！ [{DEVICE} 稼働] [F8] キーを押しながら話してください。")
+
+# --- 録音制御 ---
 audio_buffer = []
 is_recording = False
 
@@ -73,10 +91,15 @@ def process_audio():
     if len(audio_data) < SAMPLE_RATE * 0.3:
         return
 
-    # 推論実行
-    result = pipe(
+    # 通常通り model.transcribe を実行（エンコーダ計算のみ OpenVINO 側で実行される）
+    result = model.transcribe(
         audio_data,
-        generate_kwargs={"language": "japanese", "task": "transcribe"}
+        language="ja",
+        fp16=False,
+        beam_size=1,
+        best_of=1,
+        temperature=0.0,
+        condition_on_previous_text=False
     )
     
     result_text = result.get("text", "").strip()
