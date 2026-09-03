@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "faster-whisper",
+#     "pywhispercpp",
 #     "sounddevice",
 #     "numpy",
 #     "pynput",
@@ -14,21 +14,17 @@ import numpy as np
 import sounddevice as sd
 import pyperclip
 from pynput import keyboard
-from faster_whisper import WhisperModel
+from pywhispercpp.model import Model
 
 # --- 設定 ---
-# オフライン配置したモデルフォルダのパス
-MODEL_PATH = r"D:\offline_models\faster-whisper-small"
+# whisper.cpp形式のモデルバイナリのパス
+MODEL_PATH = r"D:\offline_models\ggml-small.bin"
 SAMPLE_RATE = 16000
 TRIGGER_KEY = keyboard.Key.f8  # 録音トリガーキー
 
-print("モデル読み込み中...")
-model = WhisperModel(
-    MODEL_PATH,
-    device="cpu",
-    compute_type="int8",
-    cpu_threads=4
-)
+print("whisper.cpp モデル読み込み中...")
+# n_threads でCPUのスレッド数（物理コア数推奨）を指定
+model = Model(MODEL_PATH, n_threads=4)
 print("準備完了！ [F8] キーを押しながら話してください。")
 
 # --- 録音バッファ管理 ---
@@ -53,30 +49,31 @@ def audio_callback(indata, frames, time_info, status):
     if is_recording:
         audio_buffer.append(indata.copy())
 
-# --- 推論 & アクティブウィンドウへペースト ---
+# --- 推論 & テキスト自動ペースト ---
 def process_audio():
     if not audio_buffer:
         return
     
+    # 録音データを結合して1次元のfloat32配列へ
     audio_data = np.concatenate(audio_buffer, axis=0).flatten().astype(np.float32)
     
-    # 0.3秒未満の極端に短い入力は破棄
+    # 0.3秒未満の入力はノイズとして除外
     if len(audio_data) < SAMPLE_RATE * 0.3:
         return
 
-    segments, _ = model.transcribe(
+    # pywhispercpp による推論
+    # n_processors=1, language='ja' を指定
+    segments = model.transcribe(
         audio_data,
         language="ja",
-        beam_size=1,
-        without_timestamps=True,
-        condition_on_previous_text=False
+        beam_size=1  # 速度優先のGreedy探索
     )
     
     result_text = "".join([s.text for s in segments]).strip()
     
     if result_text:
         print(f"認識結果: {result_text}")
-        # クリップボード経由で自動貼り付け
+        # クリップボード経由で即時貼り付け
         pyperclip.copy(result_text)
         ctrl = keyboard.Controller()
         with ctrl.pressed(keyboard.Key.ctrl):
